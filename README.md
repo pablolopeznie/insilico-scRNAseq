@@ -46,6 +46,7 @@ PIPELINE
 
 4.- Explore integrated_CITEseq_analysis.Rmd and enjoy the integrated analysis! 
 You will manage with:
+
 	- Batch effect correction (multisample integration)
 	- Cell clustering
 	- Combined RNA and ADT expression analysis
@@ -54,7 +55,7 @@ You will manage with:
 	- Pseudobulk analysis of individual populations between conditions
 	- Gene Set Enrichment Analysis between celltypes
 	
-	...and many many plots! :)
+	and many many plots! :)
 
 *Note*:
 Since the integration processes are computationally intensive given the big amount of cells in the analysis, there exists an alternative script (server_scrnaseq.R) which is devoted to be run in a cluster or computing server. It will create a file with the integrated Seurat object (hp_pat_integrated.Rda), which can be directly loaded into the corresponding Rmd to keep on with downstream analysis. In case you have trouble with running the integration directly from the source chunks in the Rmd file, use this script.
