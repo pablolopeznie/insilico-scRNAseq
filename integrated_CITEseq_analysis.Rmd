@@ -1,0 +1,1140 @@
+---
+title: "CITE-seq integrated BMMCs analysis"
+author: "Pablo López Nieto"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Preamble: Technical requirements
+This script requires at least 16 GB of RAM, it is preferable to run it on
+a suitable compute server rather than on your personal laptop since vectorial
+calculi will fail if requirements are not fulfilled.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Install pacman pkg if not installed
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+# Loading required packages to the session
+pacman::p_load(Seurat, SeuratObject, Biobase, ggplot2, patchwork, glmGamPoi,
+               celldex, SingleR, SingleCellExperiment, dplyr)
+```
+
+## Sample integration into a single dataset
+
+```{r}
+# Load healthy donor and patient datasets
+load('./healthy_CITE_seurat_preprocessed.rda')
+load('./patients_CITE_seu_filt.rda')
+
+full_list <- c(filtered_seurat_controls, seurat_list)
+```
+
+```{r}
+exp_names <- c(paste0('HD',1:3),paste0('AML',1:10))
+
+# Perform merge of all seurat objects into a single one
+hd.pat.seurat <- merge(full_list[[1]], full_list[-1],
+                       add.cell.ids = exp_names)
+```
+
+```{r}
+# Normalize count data and find variable genes with SCTransform()
+hd.pat.seurat <- SCTransform(hd.pat.seurat, method = 'glmGamPoi', verbose = FALSE)
+
+# Establish SCT data as active assay
+DefaultAssay(hd.pat.seurat) <- 'SCT'
+```
+
+```{r}
+# Run linear reduction of feature high dimensionality (PCA)
+hd.pat.seurat <- RunPCA(hd.pat.seurat, features = VariableFeatures(hd.pat.seurat), assay = 'SCT')
+ElbowPlot(hd.pat.seurat)
+```
+From components 10-12, the percentage of explained variance does not increase 
+significantly upon exploring more PCs. So, following the elbow rule, 12 PCs 
+will be selected for next purposes.
+
+```{r}
+# Run classification of observations in multidimensional space with UMAP
+hd.pat.seurat <- RunUMAP(hd.pat.seurat, reduction = 'pca', dims = 1:12)
+```
+
+```{r}
+# Visualize results of UMAP
+p1 <- DimPlot(hd.pat.seurat, reduction = 'umap', group.by = 'patient.id')
+p1
+```
+
+Differences between observations (cells) are due to technical effects rather
+than to biological reasons as it can be inferred from the UMAP plot. This is
+due to the existence of batch effect between experiments. Integration is
+prior to any other analysis since it will help us erase the experimental
+influence.
+
+### Integration of all 13 datasets
+
+```{r, message=FALSE}
+# Normalize each individual dataset with SCTransform (vst:glmGamPoi)
+hd.pat.integrated <- lapply(full_list, Seurat::SCTransform, method = "glmGamPoi")
+
+# Find common features to perform integration
+integ.feat <- SelectIntegrationFeatures(object.list = hd.pat.integrated, nfeatures = 2000)
+
+# Prepare the object SCT-normalized for integration
+hd.pat.integrated <- PrepSCTIntegration(object.list = hd.pat.integrated, anchor.features = integ.feat)
+
+# Run PCA to summarize the biology varibility in linear components
+hd.pat.integrated <- lapply(hd.pat.integrated, Seurat::RunPCA, features = integ.feat)
+```
+
+```{r}
+# Find most variable features to perform integration
+hd.pat.anchors <- FindIntegrationAnchors(
+  object.list = hd.pat.integrated, 
+  normalization.method = 'SCT',
+  anchor.features = integ.feat, 
+  reduction = 'rpca',
+  k.anchor = 20)
+```
+
+```{r}
+# Perform integration of all the datasets into a single one
+hd.pat.integrated <- IntegrateData(anchorset = hd.pat.anchors, normalization.method = 'SCT')
+```
+
+```{r}
+# Visualization of integrated datasets
+hd.pat.integrated <- RunPCA(hd.pat.integrated, assay = 'integrated')
+
+# Select the proper number of PCs with the elbow rule
+ElbowPlot(hd.pat.integrated)
+```
+
+```{r}
+# Run UMAP to visualize data according to non-linear relationship
+hd.pat.integrated <- RunUMAP(hd.pat.integrated, reduction = "pca", dims = 1:15, assay = 'integrated')
+```
+
+## TO BE EXECUTED IF YOU HAVE USED server_scrnaseq.R 
+
+```{r, eval=FALSE}
+rm(list = ls())
+load('./hd_pat_integrated.rda')
+```
+
+```{r}
+DefaultAssay(hd.pat.integrated)
+ElbowPlot(hd.pat.integrated)
+```
+
+```{r}
+# Visualize UMAP results
+p2 <- DimPlot(hd.pat.integrated, reduction = "umap", group.by = "patient.id")
+p2
+# p1 | p2
+```
+After integration, batch effect was effectively removed, so that biological variation
+between the cells in all datasets is represented.
+
+Before performing cell clustering and annotation, we have to correct the actual
+ADTs in the analysis since they come from experiments in which the panel of antibodies
+used vary. Therefore, there exist several rows in the counts matrix that account
+for the same surface protein but own different identifiers. Their associated counts
+will be summed into a single value for each cell.
+
+```{r}
+adts_names <- rownames(hd.pat.integrated[['ADT']]@counts)
+clean_adts <- stringr::str_extract(adts_names, "^(CD[0-9A-Za-z\\.]+|HLA-[A-Z]+|CLEC12a+|unmapped)")
+
+# There exist duplicate terms for the same ADT since they come from different experiments
+length(adts_names)
+length(unique(clean_adts))
+
+adt_counts <- GetAssayData(hd.pat.integrated, assay = 'ADT', slot = 'counts')
+adt_counts_merged <- rowsum(adt_counts, group = clean_adts)
+
+# Check if sum has been done
+head(hd.pat.integrated[['ADT']]@counts[,1])
+head(adt_counts_merged[,1])
+dim(adt_counts_merged)
+
+# Update Seurat object
+hd.pat.integrated[['ADT']] <- CreateAssayObject(counts = adt_counts_merged)
+```
+
+```{r}
+# Check cells are equal between assays
+all.equal(
+  colnames(hd.pat.integrated[['RNA']]), 
+  colnames(hd.pat.integrated[['ADT']]), 
+  colnames(hd.pat.integrated[['integrated']])
+  )
+```
+
+## Cell clustering and identification of markers
+
+```{r}
+# Load clustree to evaluate the number of clusters formed
+pacman::p_load(clustree)
+
+# Perform clustering from loads in PCs
+hd.pat.integrated <- FindNeighbors(hd.pat.integrated, reduction = 'pca', dims = 1:15)
+
+# Find clusters according to gene expression (RNA)
+hd.pat.integrated <- FindClusters(hd.pat.integrated, resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7))
+
+# Visualize the resulting clusters
+cluster_tree <- clustree(hd.pat.integrated@meta.data, prefix = "integrated_snn_res.")
+
+# Define the granularity to be used in the following steps
+Idents(hd.pat.integrated) <- 'integrated_snn_res.0.6'
+head(Idents(hd.pat.integrated), 5)
+```
+
+```{r}
+# Run and plot UMAP to see the clusters
+hd.pat.integrated <- RunUMAP(hd.pat.integrated, dims = 1:15)
+```
+
+```{r}
+p1 <- DimPlot(hd.pat.integrated, reduction = 'umap', label = TRUE, label.size = 4)
+p1
+```
+
+```{r}
+# Normalize ADT data
+DefaultAssay(hd.pat.integrated) <- "ADT"
+hd.pat.integrated <- NormalizeData(hd.pat.integrated, normalization.method = "CLR", margin = 2)
+
+# Normalize RNA data
+DefaultAssay(hd.pat.integrated) <- "RNA"
+hd.pat.integrated <- NormalizeData(hd.pat.integrated, normalization.method = "LogNormalize")
+
+# Join 13 independent normalized datasets into a single one (into data slot)
+# Only RNA, ADTs are automatically fused after SCT
+hd.pat.integrated <- JoinLayers(hd.pat.integrated, assay = 'RNA')
+```
+
+```{r}
+# Visualize expression of cell markers from ADT counts
+p1
+
+DefaultAssay(hd.pat.integrated) <- 'ADT'
+FeaturePlot(hd.pat.integrated, features = c('CD19','CD3','CD56'), cols = c('lightgray','darkgreen'))
+
+DefaultAssay(hd.pat.integrated) <- 'RNA'
+FeaturePlot(hd.pat.integrated, features = c('CD19','CD3D','NCAM1'))
+```
+
+From the simple visualization of the expression of several celltypes in the BM
+(B cells, T cells and NK cells), both at the RNA and the surface protein level,
+these populations can clearly be assigned to the clusters generated.
+
+Nonetheless, visualization is just an exploratory analysis and cell annotation
+is mandatory to keep on with the analysis.
+
+```{r}
+# Find ADT DE markers between clusters
+adt.hd.pat.markers <- FindAllMarkers(hd.pat.integrated, assay = 'ADT', only.pos = TRUE)
+save(adt.hd.pat.markers, file = './ADT_hdpat_markers.rda')
+
+# Find RNA (SCT-norm) DE markers between clusters
+hd.pat.integrated <- PrepSCTFindMarkers(hd.pat.integrated)
+
+# Ideally Likelihood Ratio Test (LR) since it is the most restrictive one, we have many features
+# But it computes a model per gene (extremely slow for big datasets)
+# For that reason, we will use Wilcoxon ranked sum test
+rna.hd.pat.markers <- FindAllMarkers(hd.pat.integrated, assay = 'SCT', only.pos = TRUE, test.use = 'wilcox')
+save(rna.hd.pat.markers, file = './RNA_hdpat_markers.rda')
+```
+
+## Cluster and cell annotation
+
+As we showed in the preliminar analysis of HD samples, the best results are
+obtained with the bmcite reference dataset, since it comprises a well-characterized
+set of celltypes from the bone marrow. It is also a dataset generated with CITE-seq
+strategy. `SingleR` package will be used to perform the annotation.
+
+```{r}
+library(SeuratData)
+data('bmcite')
+```
+
+```{r}
+# Import the reference dataset
+bmc_ref <- GetAssayData(bmcite, assay = "RNA", layer = "data")
+ref_labels <- bmcite$celltype.l2
+table(ref_labels)
+```
+```{r}
+# Extract only RNA normalized and fused data for celltype annotation
+rna.norm.hdpat <- GetAssayData(hd.pat.integrated, assay = 'RNA', layer = 'data')
+
+# Convert Seurat object into SingleCellExperiment
+hdpat.sce <- SingleCellExperiment(assays = list(logcounts = rna.norm.hdpat))
+
+# Import the cluster identity for each cell
+hdpat.clus <- Idents(hd.pat.integrated)
+```
+```{r}
+# Assign the identity of each CELL in the experiment
+pred.ct <- SingleR(
+  test = hdpat.sce,
+  ref = bmc_ref, 
+  labels = ref_labels
+)
+```
+
+```{r}
+table(pred.ct$labels)
+plotScoreHeatmap(pred.ct)
+```
+
+```{r}
+# Assign the identity of each CLUSTER in the experiment
+pred.ct.clus <- SingleR(
+  test = hdpat.sce,
+  ref = bmc_ref, 
+  labels = ref_labels,
+  clusters = hdpat.clus
+)
+```
+
+```{r}
+table(pred.ct.clus$labels)
+plotScoreHeatmap(pred.ct.clus)
+```
+
+```{r}
+# Dataframe joining seurat.cluster + SingleR celltype prediction
+# It extracts, for each individual cell, its individual prediction and its
+# prediction according to the cluster it belongs
+df_labels <- data.frame(
+  cell = names(hdpat.clus),
+  cluster = as.character(hdpat.clus),
+  celltype = pred.ct$labels
+)
+```
+
+```{r}
+# Assign the most common cell type in the cluster as its identity
+cluster_labels <- df_labels %>%
+  group_by(cluster) %>%
+  summarize(assigned_type = names(sort(table(celltype), decreasing = TRUE))[1])
+
+cluster_labels
+
+# Assign cluster identity to each cell according to SingleR
+hd.pat.integrated$SingleR_label <- cluster_labels$assigned_type[match(Idents(hd.pat.integrated), cluster_labels$cluster)]
+
+# Add individual cell prediction to Seurat object to increase resolution
+hd.pat.integrated$SingleR_label_cell <- pred.ct$labels
+```
+
+```{r}
+# Visualize the named clusters
+DefaultAssay(hd.pat.integrated) <- 'integrated'
+p1 <- DimPlot(hd.pat.integrated, reduction = 'umap', group.by = "SingleR_label", label = TRUE)
+p1
+```
+
+```{r}
+# Save annotated object to continue with the analysis
+hd.pat.integ.annot <- hd.pat.integrated
+save(hd.pat.integ.annot, file = './hdpat_integ_annot.rda')
+```
+
+## Explore cell types across phenotypic variables under study
+
+```{r}
+rm(list = ls())
+load('./hdpat_integ_annot.rda')
+```
+
+```{r}
+DefaultAssay(hd.pat.integ.annot) <- 'ADT'
+a <- VlnPlot(hd.pat.integ.annot, features = c('CD34'), pt.size = 0.1, alpha = 1) + NoLegend()
+b <- VlnPlot(hd.pat.integ.annot, features = c('CD117'), pt.size = 0.1, alpha = 1) + NoLegend()
+```
+
+```{r}
+# Plots of each cluster according to Seurat, SingleR (per cell & cluster)
+a <- DimPlot(hd.pat.integ.annot, reduction = 'umap', label = TRUE, label.size = 2.5) + ggtitle('Seurat clusters')
+b <- DimPlot(hd.pat.integ.annot, reduction = 'umap', group.by = "SingleR_label", label = TRUE, label.size = 2.5) + NoLegend()
+c <- DimPlot(hd.pat.integ.annot, reduction = 'umap', group.by = "SingleR_label_cell", label = TRUE, label.size = 2.5) + theme(legend.text = element_text(size = 8), legend.key.size = unit(0.3, "cm")) + guides(color = guide_legend(ncol = 1, override.aes = list(size = 3)))
+a | b
+```
+
+### Whole dataset
+
+Let's explore the homogeneity of the clusters detected in terms of the cell subtypes
+they contain.
+
+```{r}
+# See the proportions of SingleR clusters (a) / cells (b) in Seurat clusters
+print('Seurat clusters vs. SingleR Clusters')
+a <- as.matrix(table(hd.pat.integ.annot$integrated_snn_res.0.6, hd.pat.integ.annot$SingleR_label))
+print(a)
+
+print('Seurat clusters vs. SingleR Cells')
+b <- as.matrix(table(hd.pat.integ.annot$integrated_snn_res.0.6, hd.pat.integ.annot$SingleR_label_cell))
+print(b)
+
+# Map cols to major cell types
+#1 Seurat clusters major celltypes
+all_celltypes <- union(colnames(a), colnames(b))
+col_palette <- palette.colors(length(all_celltypes), palette = "Polychrome 36")
+names(col_palette) <- all_celltypes
+
+# Use barplots to see the composition of each cluster
+barplot(t(a), col = col_palette[colnames(a)])
+legend("topright", legend = names(col_palette[colnames(a)]), bty = 'n', fill = col_palette[colnames(a)], ncol = 2, cex = 0.7, title = 'Identified cell types')
+
+barplot(t(b), col = col_palette[colnames(b)])
+legend("topright", legend = names(col_palette[colnames(b)]), bty = 'n', fill = col_palette[colnames(b)], ncol = 3, cex = 0.7, title = 'Identified cell subtypes')
+```
+
+
+```{r}
+# Cell compisition per sample (patient)
+a <- table(hd.pat.integ.annot$SingleR_label, hd.pat.integ.annot$patient.id) 
+cells.per.pat <- colSums(a)
+
+props.per.pat <- matrix(nrow = nrow(a), ncol = ncol(a))
+
+for (i in 1:length(cells.per.pat)){
+  props.per.pat[,i] <- a[,i] / cells.per.pat[i]
+}
+
+colnames(props.per.pat) <- colnames(a)
+rownames(props.per.pat) <- rownames(a)
+colSums(props.per.pat)
+props.per.pat
+
+# Transform the prop table to a dataframe in long format
+prop_mat <- as.data.frame(props.per.pat)
+prop_mat$celltype <- rownames(props.per.pat)
+
+library(tidyr)
+library(dplyr)
+
+prop_long <- prop_mat %>%
+  pivot_longer(
+    cols = -celltype,
+    names_to = "patient",
+    values_to = "proportion"
+  )
+
+library(ggplot2)
+
+ggplot(prop_long, aes(x = patient, y = celltype, fill = proportion)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  scale_fill_gradient(
+    low = "white",
+    high = 'royalblue'
+  ) +
+  labs(
+    x = "Patient",
+    y = "Cell type",
+    fill = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+ggplot(prop_long, aes(x = patient, y = proportion, fill = celltype)) +
+  geom_col(width = 0.8, color = 'black', linewidth = 0.3) +
+  # scale_fill_manual(values = col_palette) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    x = "Patient",
+    y = "Cellular proportion",
+    fill = "Cell type"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank()
+  )
+```
+### Healthy donors dataset
+
+```{r}
+DimPlot(hd.pat.integ.annot, 
+        reduction = 'umap', 
+        label = TRUE, label.size = 2.5, group.by = 'SingleR_label_cell',
+        cells = WhichCells(hd.pat.integ.annot, expression = disease %in% c('healthy')))
+```
+
+Let's estimate celltype proportions in each dataset (according to the total
+cells) for further analysis of differences.
+
+```{r}
+hd.cells <- subset(
+  hd.pat.integ.annot,
+  cells = WhichCells(hd.pat.integ.annot, expression = disease %in% c('healthy'))
+)
+dim(hd.cells)
+```
+
+```{r, eval=FALSE}
+# Cell types per cluster
+# See the proportions of SingleR clusters (a) / cells (b) in Seurat clusters
+print('Seurat clusters vs. SingleR Clusters')
+a1 <- as.matrix(table(hd.cells$integrated_snn_res.0.6, hd.cells$SingleR_label))
+
+print('Seurat clusters vs. SingleR Cells')
+b1 <- as.matrix(table(hd.cells$integrated_snn_res.0.6, hd.cells$SingleR_label_cell))
+
+# Map cols to major cell types
+#1 Seurat clusters major celltypes
+all_celltypes <- union(colnames(a1), colnames(b1))
+col_palette <- palette.colors(length(all_celltypes), palette = "Polychrome 36")
+names(col_palette) <- all_celltypes
+
+# Use barplots to see the composition of each cluster
+barplot(t(a1), col = col_palette[colnames(a1)])
+legend("topright", legend = names(col_palette[colnames(a1)]), bty = 'n', fill = col_palette[colnames(a1)], ncol = 2, cex = 0.7, title = 'Identified cell types')
+
+barplot(t(b1), col = col_palette[colnames(b1)])
+legend("topright", legend = names(col_palette[colnames(b1)]), bty = 'n', fill = col_palette[colnames(b1)], ncol = 3, cex = 0.7, title = 'Identified cell subtypes')
+```
+
+```{r}
+# Celltype composition in healthy donor dataset
+# Get adjusted cell type frequencies in the whole dataset
+a2 <- table(hd.cells$SingleR_label)
+b2 <- table(hd.cells$SingleR_label_cell)
+
+# Get the fraction of cells over the size of the dataset
+tot_cells <- ncol(hd.cells)
+sum(a2) == sum(b2) & sum (b2) == tot_cells # Check total cell number matches IN EVERY CASE
+
+a_rel <- a2 / tot_cells
+b_rel <- b2 / tot_cells
+
+# Check al sums equal 1
+sum(a_rel)
+sum(b_rel)
+
+# Plot cell type relative frequency
+ymax.a <- max(a_rel)
+ymax.b <- max(b_rel)
+
+bp_a_1 <- barplot(a_rel, col = col_palette[names(a_rel)], las = 2, ylim = c(0, round(ymax.a+0.05, digits = 2)), cex.names = 0.7)
+text(x = bp_a_1, y = a_rel + 0.02, labels = round(a_rel, 4), cex = 0.7, srt = 90)
+
+bp_b_1 <- barplot(b_rel, col = col_palette[names(b_rel)], las = 2, ylim = c(0, round(ymax.b+0.05, digits = 2)), cex.names = 0.7)
+text(x = bp_b_1, y = b_rel + 0.02, labels = round(b_rel, 4), cex = 0.7, srt = 90)
+```
+
+### Patients dataset
+
+```{r}
+DimPlot(hd.pat.integ.annot, 
+        reduction = 'umap', 
+        label = TRUE, label.size = 2.5, group.by = 'SingleR_label_cell',
+        cells = WhichCells(hd.pat.integ.annot, expression = disease %in% c('aml_patient')))
+```
+
+```{r}
+pat.cells <- subset(
+  hd.pat.integ.annot,
+  cells = WhichCells(hd.pat.integ.annot, expression = disease %in% c('aml_patient'))
+)
+dim(pat.cells)
+```
+
+```{r, eval=FALSE}
+# ABSOLUTE VALUES
+# See the proportions of SingleR clusters (a) / cells (b) in Seurat clusters
+print('Seurat clusters vs. SingleR Clusters')
+a1 <- as.matrix(table(pat.cells$integrated_snn_res.0.6, pat.cells$SingleR_label))
+
+print('Seurat clusters vs. SingleR Cells')
+b1 <- as.matrix(table(pat.cells$integrated_snn_res.0.6, pat.cells$SingleR_label_cell))
+
+# Map cols to major cell types
+#1 Seurat clusters major celltypes
+all_celltypes <- union(colnames(a1), colnames(b1))
+col_palette <- palette.colors(length(all_celltypes), palette = "Polychrome 36")
+names(col_palette) <- all_celltypes
+
+# Use barplots to see the composition of each cluster
+barplot(t(a1), col = col_palette[colnames(a1)])
+legend("topright", legend = names(col_palette[colnames(a1)]), bty = 'n', fill = col_palette[colnames(a1)], ncol = 2, cex = 0.7, title = 'Identified cell types')
+
+barplot(t(b1), col = col_palette[colnames(b1)])
+legend("topright", legend = names(col_palette[colnames(b1)]), bty = 'n', fill = col_palette[colnames(b1)], ncol = 3, cex = 0.7, title = 'Identified cell subtypes')
+```
+
+```{r}
+# Cell composition in patients dataset
+# Get adjusted cell type frequencies in the whole dataset
+a2 <- table(pat.cells$SingleR_label)
+b2 <- table(pat.cells$SingleR_label_cell)
+
+# Get the fraction of cells over the size of the dataset
+tot_cells <- ncol(pat.cells)
+sum(a2) == sum(b2) & sum (b2) == tot_cells # Check total cell number matches IN EVERY CASE
+
+a_rel <- a2 / tot_cells
+b_rel <- b2 / tot_cells
+
+# Check al sums equal 1
+sum(a_rel)
+sum(b_rel)
+
+# Plot cell type relative frequency
+ymax.a <- max(a_rel)
+ymax.b <- max(b_rel)
+
+bp_a_2 <- barplot(a_rel, col = col_palette[names(a_rel)], las = 2, ylim = c(0, round(ymax.a+0.05, digits = 2)), cex.names = 0.7)
+text(x = bp_a_2, y = a_rel + 0.02, labels = round(a_rel, 4), cex = 0.7, srt = 90)
+
+bp_b_2 <- barplot(b_rel, col = col_palette[names(b_rel)], las = 2, ylim = c(0, round(ymax.b+0.05, digits = 2)), cex.names = 0.7)
+text(x = bp_b_2, y = b_rel + 0.02, labels = round(b_rel, 4), cex = 0.7, srt = 90)
+```
+
+If we perform an exploratory analysis of the differences in the relative abundance
+of each cell type between healthy donors and patients, the most relevant changes
+appear to affect B cell lineage, CD4 memory T-cells, together to HSC and progenitors
+of Megakaryocytes and RBCs.
+
+Let's apply statistics to test the significance of the differences observed 
+in cell composition.
+
+```{r}
+# Get celltype proportions per patient
+counts.per.pat <- table(hd.pat.integ.annot$SingleR_label, hd.pat.integ.annot@meta.data$patient.id)
+cells.per.pat <- table(hd.pat.integ.annot@meta.data$patient.id)
+
+props.per.pat <- matrix(nrow = nrow(counts.per.pat), ncol = length(cells.per.pat))
+
+for (i in 1:length(cells.per.pat)){
+  props.per.pat[,i] <- counts.per.pat[,i] / cells.per.pat[i]
+}
+
+colnames(props.per.pat) <- names(cells.per.pat)
+rownames(props.per.pat) <- rownames(counts.per.pat)
+
+# Check correction of the dataset
+colSums(props.per.pat) # -> correct if all equal to 1
+
+# Get disease state per patient
+disease_state <- hd.pat.integ.annot@meta.data %>%
+  group_by(patient.id) %>%
+  summarise(disease = unique(disease))
+
+# Order both datasets to match patient assignment
+disease_state <- disease_state[order(disease_state$patient.id),]
+disease_factor <- as.factor(ifelse(disease_state$disease == 'healthy',0,1))
+
+# Perform t-tests per row to study association
+hd.pat.t.test <- genefilter::rowttests(props.per.pat, disease_factor)
+
+# Correct the multiple t-test: control the FDR (Benjamini-Hochberg)
+hd.pat.t.test$p.val.adj.BH <- p.adjust(hd.pat.t.test$p.value, method = 'BH')
+hd.pat.t.test[order(hd.pat.t.test$p.value),]
+
+# Extract significatives with p.val.adj <= 0.05
+sig <- hd.pat.t.test$p.val.adj.BH <= 0.05
+hd.pat.t.test[sig, ]
+```
+
+```{r}
+set.seed(123)
+# Perform permutation test (non-parametric)
+hd.pat.perm.test <- apply(props.per.pat, 1, function(x){
+  coin::oneway_test(x ~ disease_factor,
+                    distribution = coin::approximate(nresample = 10000)) |> coin::pvalue()
+})
+
+hd.pat.perm.BH <- p.adjust(hd.pat.perm.test, method = 'BH')
+sig_2 <- hd.pat.perm.BH <= 0.05
+hd.pat.perm.BH[sig_2]
+```
+
+The same cell types are identified as significant with an adj.pval <= 0.05 with
+t tests and permutation tests: B cells (Naive and Memory subtypes), CD4 Naive 
+T cells and Dendritic Cells (plasmocytoid). Except for CD4 Naive, these cell types 
+correspond to some of the cell types already identified by eye in previous steps.
+
+Surprisingly, some cell types that are quantitatively different by eye, are not
+detected as significant with the contrasts performed (CD4 memmory T cells, 
+HSC and progenitors of Megakaryocytes and RBCs).
+
+More in depth:
+The comparison of cell-type proportions between groups revealed that B cells (naive and memory), CD4 naive T cells and plasmacytoid dendritic cells (pDCs) were consistently identified as significantly different (adj. p ≤ 0.05) by both t tests and permutation tests, indicating that these differences are robust and not dependent on the statistical method used.
+
+With the exception of CD4 naive T cells, these results agree with the qualitative differences previously observed in exploratory visualizations, supporting the validity of the findings. Interestingly, CD4 naive T cells were detected as significant despite not showing an obvious difference by eye, suggesting that statistical testing can capture subtle but consistent changes across patients.
+
+In contrast, other cell types that appeared quantitatively different in visual inspections, such as CD4 memory T cells, hematopoietic stem cells (HSCs), and megakaryocyte and erythroid progenitors, were not found to be statistically significant. This discrepancy can be explained by several factors:
+(i) high inter-patient variability,
+(ii) limited number of biological replicates, which reduces statistical power, and
+(iii) the low abundance of some populations, leading to increased noise in proportion estimates.
+Moreover, the application of multiple testing correction further limits the detection of marginal effects.
+
+Overall, these results indicate that only a subset of the observed differences in cell-type composition can be confidently supported by statistical evidence, highlighting both biologically relevant changes and the limitations inherent to proportion-based analyses in scRNA-seq datasets with small cohort sizes.
+
+### Responders dataset
+
+```{r}
+DimPlot(hd.pat.integ.annot, 
+        reduction = 'umap', 
+        label = TRUE, label.size = 2.5, group.by = 'SingleR_label_cell',
+        cells = WhichCells(hd.pat.integ.annot, expression = response %in% c('responder'))) + theme(legend.text = element_text(size = 8), legend.key.size = unit(0.3, "cm")) + guides(color = guide_legend(ncol = 1, override.aes = list(size = 3)))
+```
+
+```{r}
+pat.responder.cells <- subset(
+  hd.pat.integ.annot,
+  cells = WhichCells(hd.pat.integ.annot, expression = response %in% c('responder'))
+)
+dim(pat.responder.cells)
+```
+
+```{r}
+# Cell composition in patients dataset
+# Get adjusted cell type frequencies in the whole dataset
+a2 <- table(pat.responder.cells$SingleR_label)
+b2 <- table(pat.responder.cells$SingleR_label_cell)
+
+# Get the fraction of cells over the size of the dataset
+tot_cells <- ncol(pat.responder.cells)
+sum(a2) == sum(b2) & sum (b2) == tot_cells # Check total cell number matches IN EVERY CASE
+
+a_rel <- a2 / tot_cells
+b_rel <- b2 / tot_cells
+
+# Check al sums equal 1
+sum(a_rel)
+sum(b_rel)
+
+# Plot cell type relative frequency
+ymax.a <- max(a_rel)
+ymax.b <- max(b_rel)
+
+bp_a_2 <- barplot(a_rel, col = col_palette[names(a_rel)], las = 2, ylim = c(0, round(ymax.a+0.05, digits = 2)), cex.names = 0.7)
+text(x = bp_a_2, y = a_rel + 0.02, labels = round(a_rel, 4), cex = 0.7, srt = 90)
+
+bp_b_2 <- barplot(b_rel, col = col_palette[names(b_rel)], las = 2, ylim = c(0, round(ymax.b+0.05, digits = 2)), cex.names = 0.7)
+text(x = bp_b_2, y = b_rel + 0.02, labels = round(b_rel, 4), cex = 0.7, srt = 90)
+```
+
+### Nonresponders dataset
+
+```{r}
+DimPlot(hd.pat.integ.annot, 
+        reduction = 'umap', 
+        label = TRUE, label.size = 2.5, group.by = 'SingleR_label_cell',
+        cells = WhichCells(hd.pat.integ.annot, expression = response %in% c('nonresponder'))) + theme(legend.text = element_text(size = 8), legend.key.size = unit(0.3, "cm")) + guides(color = guide_legend(ncol = 1, override.aes = list(size = 3)))
+```
+
+```{r}
+pat.nonresponder.cells <- subset(
+  hd.pat.integ.annot,
+  cells = WhichCells(hd.pat.integ.annot, expression = response %in% c('nonresponder'))
+)
+dim(pat.nonresponder.cells)
+```
+
+```{r}
+# Cell composition in patients dataset
+# Get adjusted cell type frequencies in the whole dataset
+a2 <- table(pat.nonresponder.cells$SingleR_label)
+b2 <- table(pat.nonresponder.cells$SingleR_label_cell)
+
+# Get the fraction of cells over the size of the dataset
+tot_cells <- ncol(pat.nonresponder.cells)
+sum(a2) == sum(b2) & sum (b2) == tot_cells # Check total cell number matches IN EVERY CASE
+
+a_rel <- a2 / tot_cells
+b_rel <- b2 / tot_cells
+
+# Check al sums equal 1
+sum(a_rel)
+sum(b_rel)
+
+# Plot cell type relative frequency
+ymax.a <- max(a_rel)
+ymax.b <- max(b_rel)
+
+bp_a_2 <- barplot(a_rel, col = col_palette[names(a_rel)], las = 2, ylim = c(0, round(ymax.a+0.05, digits = 2)), cex.names = 0.7)
+text(x = bp_a_2, y = a_rel + 0.02, labels = round(a_rel, 4), cex = 0.7, srt = 90)
+
+bp_b_2 <- barplot(b_rel, col = col_palette[names(b_rel)], las = 2, ylim = c(0, round(ymax.b+0.05, digits = 2)), cex.names = 0.7)
+text(x = bp_b_2, y = b_rel + 0.02, labels = round(b_rel, 4), cex = 0.7, srt = 90)
+```
+
+### Individual analysis
+
+```{r}
+# Count of each cell type per patient
+cells.per.pat <- table(pat.cells$SingleR_label_cell, pat.cells$patient.id)
+
+# Total umber of cells in each patient dataset
+total.cells.pat <- table(pat.cells@meta.data$patient.id) # or: colSums(cells.per.pat)
+
+props.per.pat <- matrix(nrow = nrow(cells.per.pat), ncol = length(total.cells.pat))
+
+for (i in 1:length(total.cells.pat)){
+  props.per.pat[,i] <- cells.per.pat[,i] / total.cells.pat[i]
+}
+
+# Re-assign sample names and cell types
+colnames(props.per.pat) <- colnames(cells.per.pat)
+rownames(props.per.pat) <- rownames(cells.per.pat)
+props.per.pat
+```
+
+```{r}
+# Perform t-tests per cell type
+patient_response <- pat.cells@meta.data %>%
+  group_by(patient.id) %>%
+  summarise(response_unique = unique(response))
+
+patient_response <- patient_response[order(patient_response$patient.id),]
+patient_response
+
+pat.response <- as.factor(ifelse(patient_response$response_unique == 'responder', 1, 0))
+
+ct.perm.test <- apply(props.per.pat, 1, function(x){
+  test <- coin::oneway_test(x ~ pat.response)
+})
+
+ct.perm.test
+```
+
+
+
+
+
+
+
+### Healthy donors vs. Patients Datasets
+```{r}
+DimPlot(hd.pat.integ.annot, 
+        reduction = 'umap', label = FALSE, 
+        label.size = 2.5, group.by = 'disease') + theme(legend.text = element_text(size = 8), legend.key.size = unit(0.3, "cm")) + guides(color = guide_legend(ncol = 1, override.aes = list(size = 3)))
+```
+
+### Responder vs. Nonresponder Compositional Analysis
+
+Let's consider the comparison betweeen celltype proportions in the responders
+and nonresponders dataset. This contrast may help us identify a cell signature
+which:
+- is associated to tumor resistance in nonresponder patients (or)
+- is responsible of tumor supression in responder patients
+
+```{r, warning=FALSE}
+DimPlot(hd.pat.integ.annot, 
+        reduction = 'umap', label = TRUE, 
+        label.size = 2.5, group.by = 'SingleR_label',
+        cells = WhichCells(hd.pat.integ.annot, expression = response %in% c('responder','nonresponder'))) + theme(legend.text = element_text(size = 8), legend.key.size = unit(0.3, "cm")) + guides(color = guide_legend(ncol = 1, override.aes = list(size = 3)))
+
+DimPlot(hd.pat.integ.annot, 
+        reduction = 'umap', label = FALSE, 
+        label.size = 2.5, group.by = 'response',
+        cells = WhichCells(hd.pat.integ.annot, expression = response %in% c('responder','nonresponder'))) + theme(legend.text = element_text(size = 8), legend.key.size = unit(0.3, "cm")) + guides(color = guide_legend(ncol = 1, override.aes = list(size = 3)))
+```
+Observationally, although many cell clusters show a high level of superposition 
+between responder and nonresonder datasets, there exist several cell populations
+which have differential abundance regarding the phenotypic variable considered.
+B cell cluster, CD14 and CD16 Mono clusters appear to be different between
+conditions.
+
+```{r}
+rm(pat.cells.r)
+
+# Subset responder and nonresponder cells
+pat.cells.r <- subset(
+  hd.pat.integ.annot,
+  cells = WhichCells(hd.pat.integ.annot, expression = response %in% c('responder','nonresponder'))
+)
+dim(pat.cells.r)
+```
+
+```{r}
+# Get celltype proportions per patient
+counts.per.pat <- table(pat.cells.r$SingleR_label_cell, pat.cells.r@meta.data$patient.id)
+cells.per.pat <- table(pat.cells.r@meta.data$patient.id)
+
+props.per.pat <- matrix(nrow = nrow(counts.per.pat), ncol = length(cells.per.pat))
+
+for (i in 1:length(cells.per.pat)){
+  props.per.pat[,i] <- counts.per.pat[,i] / cells.per.pat[i]
+}
+
+colnames(props.per.pat) <- names(cells.per.pat)
+rownames(props.per.pat) <- rownames(counts.per.pat)
+
+# Check correction of the dataset
+colSums(props.per.pat) # -> correct if all equal to 1
+
+# arcsin transformation to preprocess proportions
+p <- asin(sqrt(props.per.pat))
+  
+# Get disease state per patient
+metatable <- pat.cells.r@meta.data %>%
+  group_by(patient.id) %>%
+  summarise(res = unique(response))
+
+# Order both datasets to match patient assignment
+metatable <- metatable[order(metatable$patient.id),]
+response_factor <- as.factor(ifelse(metatable$res %in% c('responder'),0,1))
+
+# Perform t-tests per row to study association
+hd.pat.t.test <- genefilter::rowttests(p, response_factor)
+
+# Correct the multiple t-test: control the FDR (Benjamini-Hochberg)
+hd.pat.t.test$p.val.adj.BH <- p.adjust(hd.pat.t.test$p.value, method = 'BH')
+hd.pat.t.test[order(hd.pat.t.test$p.value),]
+
+# Extract significatives with p.val.adj <= 0.05
+sig <- hd.pat.t.test$p.val.adj.BH <= 0.05
+hd.pat.t.test[sig, ]
+
+## Using limma
+library(limma)
+
+props_t <- p
+design <- model.matrix(~ 0 + response_factor)
+contrasts <- makeContrasts(
+  r.nr = response_factor1 - response_factor0,
+  levels = design
+)
+
+fit <- lmFit(props_t, design)
+fit1 <- contrasts.fit(fit, contrasts = contrasts)
+fit_moderate <- eBayes(fit1)
+
+comp_res <- topTable(fit_moderate, coef = 'r.nr', number = Inf)
+comp_res
+```
+
+Although statistical significance may be limited by the small sample size, five main compositional differences are observed between responders and non-responders.
+
+CD14⁺ monocytes account for 10.88% of total cells in bone marrow aspirates from responders, whereas this fraction increases to 23.83% in non-responders.
+
+CD4 memory T cells represent 20.49% of the cellular composition in responders, while their proportion decreases to 15.07% in non-responders.
+
+The HSC compartment constitutes 9.22% of total cells in responders but is reduced by nearly half in non-responders, reaching 4.97%.
+
+Megakaryocyte progenitors are enriched in non-responders, increasing from 0.96% in responders to 3.12%.
+
+Finally, erythroid progenitors show a marked enrichment in responders, with their average proportion increasing from 1.43% in non-responders to 8.67% in responders.
+
+More in detail:
+Although no statistically significant differences were detected after multiple testing correction, likely due to the limited number of patients and the high inter-patient variability, clear compositional trends were observed between responders and non-responders. In particular, non-responders showed an increased proportion of CD14⁺ monocytes and megakaryocyte progenitors, together with a reduction in CD4 memory T cells and HSCs, suggesting a bone marrow microenvironment skewed towards myeloid differentiation and inflammatory states. In contrast, responders were characterized by a higher abundance of erythroid progenitors and memory T cells, which may reflect a more preserved hematopoietic hierarchy and immune competence. These trends are consistent with previous reports describing the association of myeloid expansion, immune dysfunction, and altered niche composition with poor prognosis and therapy resistance in AML. Importantly, given the small cohort size, these observations should be interpreted as exploratory and warrant validation in larger independent datasets.
+
+## Pseudobulk analysis of CD4 Memory T-cells
+
+To conclude the analysis, we will perform a DE analysis between a celltype in both experimental groups:
+responders and nonresponders. CD4 lymphocytes, memory subtype, was selected because this population showed one of the most pronounced compositional differences between the two experimental groups in the single-cell analysis. Specifically, CD4 memory T cells were enriched in responders compared to nonresponders, suggesting a potential association with treatment outcome. Additionally, this population of cells is one of the most abundant in general terms in all patient samples.
+
+CD4 memory T cells play a central role in adaptive immunity and have been implicated in antitumor immune responses and immunotherapy efficacy, making them a biologically relevant population to explore in this context. By restricting the analysis to this cell type, we reduce confounding effects driven by differences in cellular composition across samples and increase sensitivity to detect cell-intrinsic gene expression changes associated with clinical response.
+
+```{r}
+# Select cd14 monocytes from the whole object
+cell.type <- 'CD4 Memory'
+
+sub.cells <- subset(
+  pat.cells.r,
+  cells = WhichCells(pat.cells.r, expression = SingleR_label_cell %in% c(cell.type))
+)
+
+table(sub.cells$response)
+```
+
+```{r}
+# Aggregate the expression of each cell per sample
+ag.counts <- AggregateExpression(sub.cells,
+                    group.by = c('response','patient.id'),
+                    assay = 'RNA',
+                    slot = 'counts',
+                    return.seurat = FALSE)
+
+ag.counts <- ag.counts$RNA
+
+# Genes x Patient (for CD14 mono)
+head(ag.counts)
+```
+
+```{r}
+# Create data.frame for metadata
+metadata <- data.frame(samples = colnames(ag.counts),
+                       factor = sub('_.*', '\\1', colnames(ag.counts)))
+rownames(metadata) <- metadata$samples
+metadata$samples <- NULL
+```
+
+```{r}
+# Create DESeq2 Object
+deseq.cd14 <- DESeq2::DESeqDataSetFromMatrix(countData = ag.counts, 
+                                             colData = metadata,
+                                             design = ~ factor)
+# Filter
+keep <- rowSums(counts(deseq.cd14) > 20) > 3
+deseq.cd14 <- deseq.cd14[keep, ]
+
+# Run DE analysis
+deseq.cd14 <- DESeq2::DESeq(deseq.cd14)
+
+# Extract results object
+DESeq2::resultsNames(deseq.cd14)
+res <- DESeq2::results(deseq.cd14, name = 'factor_responder_vs_nonresponder')
+res <- res[!is.na(res$padj),]
+res[res$padj < 0.05,]
+
+save(res, file = './DE_CD4mem_respnonresp.rda')
+```
+
+Seventeen (17) genes were identified as differentially expressed in CD4
+memmory lymphocytes between responders and nonresponders (p.val.adj < 0.05) under
+Benjamini-Hochberg correction (error rate: FDR).
+
+Although only 17 genes were identified as differentially expressed, this number is biologically meaningful given that the comparison involves the same cell type (CD4 memory T cells) across two conditions. Large transcriptional shifts are not expected between identical cell populations; instead, subtle but consistent changes reflecting different activation or functional states are more plausible. Therefore, the detection of a limited set of robust DEGs suggests the presence of specific transcriptional programs associated with response status rather than broad cell identity changes.
+
+### Gene set enrichment analysis
+
+To further explore the transcriptional differences between responders and nonresponders, we performed a Gene Set Enrichment Analysis (GSEA) on CD4 memory T cells. Although the number of individual differentially expressed genes is limited, GSEA allows us to assess coordinated changes in predefined biological pathways or gene sets, rather than focusing solely on single-gene significance. This approach can detect subtle but biologically meaningful trends in pathway activity that might not be captured by conventional differential expression analysis. By ranking all genes according to their differential expression statistics, GSEA evaluates whether genes belonging to specific pathways are preferentially up- or down-regulated in responders versus nonresponders. This method is particularly suitable for our dataset, where changes at the level of individual genes are modest, but cumulative effects on pathways could reveal important immunological mechanisms underlying treatment response.
+
+```{r}
+rm(list = ls())
+load('./DE_CD4mem_respnonresp.rda')
+
+# Get gene list
+res[res$padj < 0.05,]
+gene.list <- res$stat
+names(gene.list) <- rownames(res)
+gene.list <- sort(gene.list, decreasing = TRUE)
+
+# Download gene sets from EnrichmentBrowser
+library(EnrichmentBrowser)
+
+a <- showAvailableSpecies(db = c("go", "kegg", "msigdb", "enrichr"), cache = TRUE)
+a[a$tax == 'H. sapiens',]
+
+# Download msigdb, accurate for inmunology
+msig.set <- getGenesets(org = 'hsa', db = 'msigdb')
+```
+
+```{r}
+# Get ENTREZIDs for the differentially expressed genes between CD4 mem cells
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "genes", dataset = 'hsapiens_gene_ensembl')
+
+# Run query
+query <- getBM(mart = ensembl, 
+                 attributes = c('entrezgene_id','hgnc_symbol'),
+                 filters = 'hgnc_symbol',
+                 values = rownames(res))
+
+# Filter the returned dataframe
+query <- query[!is.na(query$entrezgene_id), ]
+query <- query[!duplicated(query$hgnc_symbol), ]
+```
+
+```{r}
+# Prepare gene list for GSEA
+gene.list.entrez <- gene.list[query$hgnc_symbol]
+names(gene.list.entrez) <- query$entrezgene_id
+gene.list.entrez <- sort(gene.list.entrez, decreasing = TRUE)
+gene.list.entrez <- gene.list.entrez[!is.na(gene.list.entrez)]
+
+gene_list_df <- data.frame(entrez = names(gene.list.entrez),
+                           stat = gene.list.entrez,
+                           stringsAsFactors = FALSE)
+
+gene_list_df <- gene_list_df %>%
+  group_by(entrez) %>%
+  summarize(stat = max(stat), .groups = "drop")
+
+gene.list.entrez <- gene_list_df$stat
+names(gene.list.entrez) <- gene_list_df$entrez
+
+gene.list.entrez <- sort(gene.list.entrez, decreasing = TRUE)
+head(gene.list.entrez)
+```
+
+```{r}
+library(fgsea)
+
+# Run GSEA
+gsea_res <- fgsea::fgsea(
+  pathways = msig.set,
+  stats = gene.list.entrez
+)
+```
+
+```{r}
+# Visualize results
+gsea_res[gsea_res$padj < 0.05,]
+
+# Plot enrichment of a concrete pathway
+library(patchwork)
+a <- plotEnrichment(msig.set[["M5890_HALLMARK_TNFA_SIGNALING_VIA_NFKB"]], 
+               gene.list.entrez) + labs(title = "GSEA: TNFA signalling via NFKB")
+b <- plotEnrichment(msig.set[["M5913_HALLMARK_INTERFERON_GAMMA_RESPONSE"]], 
+               gene.list.entrez) + labs(title = "GSEA: Interferon Gamma Response")
+a | b
+```
+
+```{r}
+# Top 10 NES (p.adj.bh < 0.05)
+fgsea_sig <- gsea_res[gsea_res$padj < 0.05, ]
+top10 <- fgsea_sig[order(fgsea_sig$padj, decreasing = TRUE)][1:15, ]
+
+# Dotplot
+dp <- ggplot(top10, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill = NES)) +
+  coord_flip() +
+  labs(x = "Pathway", y = "Normalized Enrichment Score (NES)") +
+  theme_minimal() + scale_fill_gradient2(low = "royalblue", mid = "white", high = "orange", midpoint = 0) + ggtitle('Memory CD4: Responders vs. Nonresponders')
+```
+
+### Overepresentation analysis (ORA)
+
+```{r}
+# Get only significant results
+res.sig <- rownames(res[res$padj < 0.05,])
+
+# Get KEGG terms
+msig.set <- getGenesets(org = 'hsa', db = 'kegg')
+
+# Run query
+query <- getBM(mart = ensembl, 
+               attributes = c('entrezgene_id','hgnc_symbol'),
+               filters = 'hgnc_symbol', values = res.sig)
+
+# Filter the returned dataframe
+query <- query[!is.na(query$entrezgene_id), ]
+query <- query[!duplicated(query$hgnc_symbol), ]
+
+# Get ENTREZ
+res.entrez <- query$entrezgene_id
+```
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+kegg_ora <- enrichKEGG(gene = res.entrez,
+                       organism = "hsa",
+                       pvalueCutoff = 0.05)
+
+```
+
+```{r}
+res_kegg <- sort_by(kegg_ora@result, y = kegg_ora@result$qvalue)
+res_kegg[res_kegg$qvalue < 0.1,]
+```

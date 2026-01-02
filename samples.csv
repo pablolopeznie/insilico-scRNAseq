@@ -1,0 +1,12 @@
+path_cite,patient_id,ds,response,AML_type,age_range,sex
+'./GSE271406/PDAML1_EOC2/',PDAML1_EOC2,CR,responder,relapse,70-79,M
+'./GSE271406/PDAML2/',PDAML2,SD,responder,refractory,60-69,F
+'./GSE271406/PDAML3/',PDAML3,SD,responder,refractory,50-59,F
+'./GSE271406/PDAML4/',PDAML4,DP,nonresponder,refractory,30-39,M
+'./GSE271406/PDAML5_EOC2/',PDAML5_EOC2,CR,responder,relapse,70-79,M
+'./GSE271406/PDAML6/',PDAML6,DP,nonresponder,relapse,50-59,F
+'./GSE271406/PDAML7/',PDAML7,DP,nonresponder,refractory,50-59,F
+'./GSE271406/PDAML8/',PDAML8,DP,nonresponder,refractory,60-69,M
+'./GSE271406/PDAML9/',PDAML9,SD,responder,refractory,60-69,F
+'./GSE271406/PDAML10/',PDAML10,PR,responder,refractory,80-89,M
+

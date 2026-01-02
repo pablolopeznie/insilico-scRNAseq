@@ -1,0 +1,992 @@
+---
+title: "scRNAseq analysis with Seurat"
+author: "Pablo López Nieto"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Install pacman pkg if not installed
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+# Loading required packages to the session
+pacman::p_load(Seurat, Biobase, ggplot2, patchwork, glmGamPoi, celldex, SingleR,
+               SingleCellExperiment, dplyr)
+```
+
+## Importing Seurat Objects
+
+Seurat objects for all 13 samples in the study were created previously in
+the script `create_seurat_objects.R`. Individual R lists were generated to
+store healthy donor (3) and clinical study patient (10) samples independently, 
+since the source formats differed slightly.
+
+We will start by loading HD samples in order to integrate all 3 samples into
+a single dataset. Batch effects will be corrected. The list is asssociated
+to a variable named `seurat_controls`.
+
+```{r}
+# Load healthy donor Rda (pregenerated)
+load('./healthy_CITE_seurat.rda')
+```
+
+```{r}
+# Inspect the imported object (stored in seurat_controls variable)
+class(seurat_controls)    # Data type: list
+length(seurat_controls)   # 3 independent CITE-seq experiments
+class(seurat_controls[[1]]) # Stored in 'SeuratObject' s4 object
+
+# Access the first element and visualize meta.data slot
+dim(seurat_controls[[1]]) # -> 32738 features, 5484 cell identities
+head(seurat_controls[[1]]@meta.data) 
+```
+
+*Note that covariables associated to AML are specified as missing values (NA)
+for healthy donor samples.*
+
+Once the object is loaded we will split each SeuratObject in order to perform
+individual QC analysis. It is advisable to select different tresholds for the
+QC metrics in each experiment since experimental yields are variable. Once
+pre-processing has been completed, all data sources will be integrated into a
+single dataset in order to account for the maximum amount of variance for each
+cell type.
+
+## Preprocessing and QC metrics
+
+```{r}
+# Split each object into an independent variable
+hd1_seu <- seurat_controls[[1]]
+hd2_seu <- seurat_controls[[2]]
+hd3_seu <- seurat_controls[[3]]
+
+# Remove the original list from the session to save memmory
+# rm(seurat_controls)
+```
+
+### Healthy donor 1 - CITE-seq (GEX+ADT)
+
+```{r}
+# Define RNA slot as active assay
+hd1_seu@active.assay <- 'RNA'
+
+# Number of cells and features
+dim(hd1_seu) # -> 32738 features, 5484 cells
+```
+
+```{r, warning=FALSE}
+#1 Cell metrics
+# Evaluate nCount, nFeature and mitochondrial fraction for each cell
+hd1_seu[['mito.per']] <- PercentageFeatureSet(hd1_seu, pattern = "^MT-")
+
+# Plot QC metrics to evaluate reasonable thresholds
+VlnPlot(hd1_seu, features = c('nCount_RNA','nFeature_RNA','mito.per'), 
+        group.by = 'patient.id')
+
+# We can plot correlation plots between the studied QC metrics
+FeatureScatter(hd1_seu, feature1 = 'nFeature_RNA', feature2 = 'nCount_RNA', group.by = 'patient.id')
+FeatureScatter(hd1_seu, feature1 = "nCount_RNA", feature2 = "mito.per", group.by = 'patient.id')
+```
+  
+*Notice how nFeature and nCount exhibit a high positive correlation, while nCount
+and mito.per are uncorrelated.*
+
+- **nFeature** represents the number of genes with at least 1 UMI associated to the 
+same 10X barcode, in other words, the number of unique genes/transcripts per cell.
+- **nCount** represents the sum of all UMIs detected per cell, that is to say, the
+total count of transcripts detected for a given cell identity.
+
+Given their correlation, we will compass the filtering based on nFeature rather 
+than nCount, since the working scale is more manegeable. We aim filter out 
+droplets with dead or highly stressed cells, doublets or empty ones. For so,
+based on the violin plots, we will discard cells which exhibit nFeature < 500,
+nFeature > 2500 and mito.per > 20. 
+
+*These thresholds have been selected by eye and are susceptible to be adapted 
+by the criteria of the data analyst.*
+
+```{r}
+# Subset original cells 
+hd1_seu <- subset(
+  hd1_seu,
+  subset = nFeature_RNA > 500 & nFeature_RNA < 2500 & mito.per < 20)
+
+# Assess the number of filtered cells
+dim(hd1_seu) # -> 32738 features, 4386 cells
+```
+
+The QC of genes and cells has filtered out 1098 cell identities from the 
+analysis, from 5484 cells to 4386 cells.
+
+The same steps will be repeated for th resting Seurat objects.
+
+### Healthy donor 2 - CITE-seq (GEX+ADT)
+
+```{r}
+# Define RNA slot as active assay
+hd2_seu@active.assay <- 'RNA'
+
+# Number of cells and features
+dim(hd2_seu) # -> 33538 features, 4634 cells
+```
+
+```{r, warning=FALSE}
+#1 Cell metrics
+# Evaluate nCount, nFeature and mitochondrial fraction for each cell
+hd2_seu[['mito.per']] <- PercentageFeatureSet(hd2_seu, pattern = "^MT-")
+
+# Plot QC metrics to evaluate reasonable thresholds
+VlnPlot(hd2_seu, features = c('nCount_RNA','nFeature_RNA','mito.per'), 
+        group.by = 'patient.id')
+
+# We can plot correlation plots between the studied QC metrics
+FeatureScatter(hd2_seu, feature1 = 'nFeature_RNA', feature2 = 'nCount_RNA', group.by = 'patient.id')
+FeatureScatter(hd2_seu, feature1 = "nCount_RNA", feature2 = "mito.per", group.by = 'patient.id')
+```
+In this case, although there also exists a good correlation between nCount and 
+nFeature (0.84), we will establish individual thresholds to fine-tune the
+selection of cells.
+
+```{r}
+# Subset original cells 
+hd2_seu <- subset(
+  hd2_seu,
+  subset = nFeature_RNA > 250 & nFeature_RNA < 2500 & mito.per < 20 
+  & nCount_RNA > 1000 & nCount_RNA < 6000)
+
+# Assess the number of filtered cells
+dim(hd2_seu) # -> 33538 features, 3869 cells
+```
+
+The QC of genes and cells has filtered out 765 cell identities from the 
+analysis, from 4634 cells to 3869 cells.
+
+### Healthy donor 3 - CITE-seq (GEX+ADT)
+
+```{r}
+# Define RNA slot as active assay
+hd3_seu@active.assay <- 'RNA'
+
+# Number of cells and features
+dim(hd3_seu) # -> 33538 features, 3165 cells
+```
+
+```{r, warning=FALSE}
+#1 Cell metrics
+# Evaluate nCount, nFeature and mitochondrial fraction for each cell
+hd3_seu[['mito.per']] <- PercentageFeatureSet(hd3_seu, pattern = "^MT-")
+
+# Plot QC metrics to evaluate reasonable thresholds
+VlnPlot(hd3_seu, features = c('nCount_RNA','nFeature_RNA','mito.per'), 
+        group.by = 'patient.id')
+
+# We can plot correlation plots between the studied QC metrics
+FeatureScatter(hd3_seu, feature1 = 'nFeature_RNA', feature2 = 'nCount_RNA', group.by = 'patient.id')
+FeatureScatter(hd3_seu, feature1 = "nCount_RNA", feature2 = "mito.per", group.by = 'patient.id')
+```
+
+```{r}
+# Subset original cells 
+hd3_seu <- subset(
+  hd3_seu,
+  subset = nFeature_RNA > 300 & nFeature_RNA < 2500 & mito.per < 15)
+
+# Assess the number of filtered cells
+dim(hd3_seu) # -> 33538 features, 2717 cells
+```
+
+The QC of genes and cells has filtered out 448 cell identities from the 
+analysis, from 3165 cells to 2717 cells.
+
+Once each object has been pre-processed to filter out dropout effects, the
+following steps can be performed simultaneously. Filtered count matrices
+will be incoporated into a single list.
+
+```{r}
+# Join preprocessed Seurat objects
+filtered_seurat_controls <- list(hd1_seu, hd2_seu, hd3_seu)
+
+# Save the object for further uses
+save(filtered_seurat_controls, file = './healthy_CITE_seurat_preprocessed.rda')
+```
+
+## Normalization, Variable Feature Selection and Dimensionality Reduction
+
+Now, we will compare the methodological difference between merging all sources
+of data into a single dataset and performing a proper integration process that
+is aware of batch effects correction.
+
+```{r}
+rm(list = ls())
+
+# Load the list with preprocessed Seurat containers
+load('./healthy_CITE_seurat_preprocessed.rda')
+```
+
+### Merge Datasets without Integration
+
+```{r}
+# Merge first object [[1]] with the rest [-1]
+combined_seu <- merge(filtered_seurat_controls[[1]], y = filtered_seurat_controls[-1],
+                      add.cell.ids = c('HD1','HD2','HD3'))
+```
+
+```{r}
+# Normalize and FindVariableFeatures with SCTransform()
+combined_seu <- SCTransform(combined_seu, verbose = FALSE, method = 'glmGamPoi')
+
+# Run PCA (linear dimensionality reduction) -> No he indicado assay = 'SCT', no afecta, pero saberlo
+combined_seu <- RunPCA(combined_seu, features = VariableFeatures(object = combined_seu))
+ElbowPlot(combined_seu, ndims = 20)
+```
+```{r}
+# Run UMAP
+combined_seu <- RunUMAP(combined_seu, reduction = "pca", dims = 1:15)
+
+# Visualize UMAP results
+DimPlot(combined_seu, reduction = "umap", group.by = "patient.id",
+        cols = c('#007190','#f3a257','#34454c'))
+```
+
+As it can be inferred from the UMAP plot, cells scatter and group by patient,
+rather than by their biological traits. That is to say, simple merging brings
+batch effects into the analysis, which need to be corrected. 
+
+Integration follows a dedicated workflow which comprises the detection of
+common features, normalizing counts matrices, selecting the most variable
+common genes between experimental replicates, summarizing them into principal
+components and, finally, joining up all datasets into a single one.
+
+### Integration with Batch Effect Correction
+
+```{r}
+# Use SCTransform() as Normalization method
+integrated_seu <- lapply(filtered_seurat_controls, Seurat::SCTransform, method = "glmGamPoi")
+
+# Find common features to perform integration
+features <- SelectIntegrationFeatures(object.list = integrated_seu, nfeatures = 3000)
+
+# Prepare the object SCT-normalized for integration
+integrated_seu <- PrepSCTIntegration(object.list = integrated_seu, anchor.features = features)
+
+# Run linear reduction of dimensionality to summarize variables (PCA)
+integrated_seu <- lapply(integrated_seu, Seurat::RunPCA, features = features)
+```
+
+```{r}
+# Find most variable features to perform integration
+healthy_anchors <- FindIntegrationAnchors(
+  object.list = integrated_seu, normalization.method = "SCT",
+  anchor.features = features, dims = 1:30,
+  reduction = "rpca", k.anchor = 20)
+```
+
+```{r}
+# Integrate all 3 sources of data into a single one
+integrated_hd_sct <- IntegrateData(anchorset = healthy_anchors, normalization.method = "SCT")
+```
+
+```{r}
+# Visualization of integrated datasets
+integrated_hd_sct <- RunPCA(integrated_hd_sct) # Linear reduction (PCA)
+
+# Select the proper number of PCs with the elbow rule
+ElbowPlot(integrated_hd_sct, ndims = 20)
+```
+
+```{r}
+# Run UMAP to visualize data according to non-linear relationship
+integrated_hd_sct <- RunUMAP(integrated_hd_sct, reduction = "pca", dims = 1:15)
+
+# Visualize UMAP results
+DimPlot(integrated_hd_sct, reduction = "umap", group.by = "patient.id", 
+        cols = c('#007190','#f3a257','#34454c'))
+```
+
+After integration is perfomed, batch effect is effectively removed from the data.
+
+```{r}
+p1 <- DimPlot(combined_seu, reduction = "umap", group.by = "patient.id",
+        cols = c('#007190','#f3a257','#34454c'))
+p2 <- DimPlot(integrated_hd_sct, reduction = "umap", group.by = "patient.id", 
+        cols = c('#007190','#f3a257','#34454c'))
+p1 | p2
+```
+
+```{r}
+# Save the integrated dataset to 
+save(integrated_hd_sct, file = './integrated_HD_CITE.rda')
+```
+
+## Cell clustering and marker expression
+
+```{r}
+# Remove old objects to clean up memory
+rm(list = ls())
+
+# Load integrated dataset
+load('./integrated_HD_CITE.rda')
+```
+
+### RNA data
+
+```{r}
+# Confirm we are working with integrated transcriptomics data
+DefaultAssay(integrated_hd_sct) <- 'integrated'
+```
+
+```{r}
+# Load clustree pkg to evaluate granularity of clustering process
+pacman::p_load(clustree)
+
+# Perform clustering from principal components
+# Find neighbour cells (simmilar regarding feature expression)
+integrated_hd_sct <- FindNeighbors(integrated_hd_sct, dims = 1:20)
+
+# Find clusters of cells
+integrated_hd_sct <- FindClusters(
+  integrated_hd_sct, resolution = c(0.2, 0.3, 0.4, 0.5, 0.6))
+
+# Visualize clustering at different resolutions
+clustree(integrated_hd_sct@meta.data, prefix = "integrated_snn_res.")
+
+# Identify the cluster to which each cell belongs given a resolution level
+Idents(integrated_hd_sct) <- "integrated_snn_res.0.6"
+head(Idents(integrated_hd_sct), 5)
+```
+
+At this point, we will be choosing 0.6 as the preferred resolution since the
+clusters it defines are consistent with the majority of preceeding resolutions
+but it stratifies bigger clusters into subclusters, which may be helpful
+to fine-tune cell subtypes identification.
+
+```{r}
+# We run UMAP again give identity to the clusters
+integrated_hd_sct <- RunUMAP(integrated_hd_sct, dims = 1:15)
+
+# Plot UMAP
+seu_dm <- DimPlot(integrated_hd_sct, reduction = "umap", label = TRUE)
+seu_dm
+```
+
+### ADT data
+We can support cell cluster identification with ADT data, which is in fact
+the advantage of CITE-seq strategy. For example, we will try yo identify NK
+cells in healthy donor data by visualizing the expression of several markers,
+integrating transcriptomic and surface protein data.
+
+CD56 (ADT) / NCAM1 (RNA) : typical NK marker, expressed in all cells with NK
+activity and in some minor T-cell subpopulations.
+
+CD16 (ADT) / FCGR3A (RNA): expressed on natural killer (NK) cells as an integral membrane glycoprotein anchored through a transmembrane peptide
+
+CD244 (ADT): cell surface receptor expressed on natural killer (NK) cells (and some T cells) that mediate non-major histocompatibility complex (MHC) restricted killing
+
+PRF1 (RNA): perforin, cytotoxic activity
+
+CD3- (ADT): typical T-cell marker which is not expressed in NK cells, used
+to exclude T lymphocytes from NK.
+
+
+```{r}
+# ADT rownames include capture tags, so correspondences are not direct
+#1 CD with tags
+old_names <- rownames(integrated_hd_sct[['ADT']])
+old_names
+
+#2 CD without tags
+new_names <- sub("-.*$", "", old_names)
+new_names
+```
+
+```{r}
+# Normalize ADT data
+DefaultAssay(integrated_hd_sct) <- "ADT"
+integrated_hd_sct <- NormalizeData(integrated_hd_sct, normalization.method = "CLR", margin = 2)
+
+# Normalize RNA data
+DefaultAssay(integrated_hd_sct) <- "RNA"
+integrated_hd_sct <- NormalizeData(integrated_hd_sct, normalization.method = "LogNormalize")
+
+# Join 3 independent normalized datasets into a single one 
+# Only RNA, ADTs are automatically fused after SCT
+integrated_hd_sct <- JoinLayers(integrated_hd_sct, assay = 'RNA')
+```
+
+```{r}
+# Visualize the expression of a transcript and its surface protein
+DefaultAssay(integrated_hd_sct) <- "ADT"
+p1 <- FeaturePlot(integrated_hd_sct, old_names[c(27, 8, 13)], cols = c("lightgrey", "darkgreen"))
+
+DefaultAssay(integrated_hd_sct) <- "RNA"
+p2 <- FeaturePlot(integrated_hd_sct, c('NCAM1', 'FCGR3A', 'PRF1'))
+
+# place plots side-by-side
+p1 / p2
+```
+
+ADT and RNA expression values of the selected markers have consistently identified
+cluster number 4 as NK cells (CD56/NCAM+, CD16/FCGR3A+, CD244+, PRF1+). 
+
+We can now visualize the expression of CD3 marker along all cells in each 
+cluster to confirm the identity of cluster 5.
+
+```{r, warning=FALSE}
+DefaultAssay(integrated_hd_sct) <- "ADT"
+VlnPlot(integrated_hd_sct, old_names[17]) + ggtitle("CD3 protein") 
+VlnPlot(integrated_hd_sct, old_names[28]) + ggtitle("CD7 protein")
+```
+
+In brief, we have confirmed cluster 4 groups NK cell together since the cells
+do not express CD3 cell surface protein. Interestingly, this analysis has
+also revealed clusters 2, 3, 6, 8, 12, 15 as T-cells, since they are clearly 
+CD3+ as compared to the rest.
+
+
+```{r, eval=FALSE}
+# We can identify markers for each cluster and assay type
+# ADT
+adt_markers <- FindAllMarkers(integrated_hd_sct, assay = "ADT", only.pos = TRUE)
+save(adt_markers, file = './adt_markers_HD.rda')
+
+# RNA
+# Important: per se, SCT-data are not comparable between assays
+# We need to reverse the fitted model and get the expr. values 
+integrated_hd_sct <- PrepSCTFindMarkers(integrated_hd_sct)
+
+rna_markers <- FindAllMarkers(integrated_hd_sct, assay = "SCT", only.pos = TRUE, test.use = 'LR')
+save(rna_markers, file = './rna_markers_HD.rda')
+```
+
+```{r}
+# Visualize ADT markers
+adt_markers
+
+# Visualize RNA markers
+sig_markers <- rna_markers$p_val_adj < 0.001 & rna_markers$avg_log2FC > 2
+rna_markers[sig_markers,]
+```
+
+## Cluster annotation and cell type identification
+
+Finally, once differential GEX markers have been identified, we will adress 
+cell type annotation with `SingleR` package. This package performs cell type
+recognition from reference transcriptomic datasets of pure cell types
+to infer the origin of each cell independently. References will be accessed
+from 2 sources:
+
+- `celldex` package, which serves as a catalogue of scRNA-seq references 
+already log-normalized to be comparable.
+
+- Seurat collection of annotated BMMCs (bmcite), which is also a CITE-seq
+dataset of 11769 cells from 10X Genomics. This reference dataset was 
+generated as part of the Hao and Hao et al. (2020) paper. It is comprised 
+of data from eight volunteers enrolled in an HIV vaccine trial from which 
+three time point samples were taken at day 0, 3, and 7 following vaccination. 
+All 24 samples were processed with a CITE-seq panel of 228 TotalSeq A antibodies 
+to generate single-cell RNA and ADT data.
+
+We will compare the results obtained with each approximation and select the
+most suitable one, that is to say, the one that offers the most homogeneous
+annotations.
+
+### celldex annotations
+
+```{r}
+# Consult existing references
+as.data.frame(surveyReferences())
+```
+
+We will select 2 different references:
+
+- `novershtern_hematopoietic` for BM and progenitor data
+- `monaco_inmune` for differentiated inmune cell types
+
+```{r}
+# Fetch wanted references
+ref_novershtern <- fetchReference("novershtern_hematopoietic", version = "2024-02-26")
+ref_monaco <- fetchReference("monaco_immune", version = "2024-02-26")
+```
+
+The imported objects are S4 objects of class `SummarizedExperiment`, 
+which typically contain RNA-seq data.
+
+```{r}
+# Interrogate imported objects
+#1 novershtern dataset
+class(ref_novershtern)
+ref_novershtern
+
+#2 monaco dataset
+class(ref_monaco)
+ref_monaco
+```
+
+In order to use SingleR to annotate cell types, we must convert Seurat object
+to `SingleCellExperiment` format. Seurat includes a dedicated function to perform
+such conversion.
+
+```{r}
+# Extract only RNA normalized data for celltype annotation
+rna_norm_hd <- GetAssayData(integrated_hd_sct, assay = 'RNA', layer = 'data')
+
+# Convert Seurat object into SingleCellExperiment
+hd_sce <- SingleCellExperiment(assays = list(logcounts = rna_norm_hd))
+
+# Import the cluster identity for each cell
+hd_clusters <- Idents(integrated_hd_sct)
+```
+
+#### Dataset novershtern_hematopoietic
+
+```{r}
+# Run SingleR to identify cell types INDIVIDUALLY
+pred.ct <- SingleR(
+  test = hd_sce,
+  ref = ref_novershtern,
+  labels = ref_novershtern$label.main
+)
+```
+
+```{r}
+# Evaluate the predicted cell types
+table(pred.ct$labels)
+plotScoreHeatmap(pred.ct)
+plotMarkerHeatmap(results = pred.ct, test = hd_sce, label="NK cells")
+```
+
+```{r}
+# Run SingleR to identify cell types PER CLUSTER
+pred.ct.2 <- SingleR(
+  test = hd_sce,
+  ref = ref_novershtern,
+  labels = ref_novershtern$label.main,
+  clusters = hd_clusters
+)
+```
+
+```{r}
+# Evaluate the predicted cell types
+table(pred.ct.2$labels)
+plotScoreHeatmap(pred.ct.2)
+```
+
+#### Dataset monaco_inmune
+
+```{r}
+# Run SingleR to identify cell types INDIVIDUALLY
+pred.ct.3 <- SingleR(
+  test = hd_sce,
+  ref = ref_monaco,
+  labels = ref_monaco$label.main
+)
+```
+
+```{r}
+# Evaluate the predicted cell types
+table(pred.ct.3$labels)
+plotScoreHeatmap(pred.ct.3)
+plotMarkerHeatmap(results = pred.ct.3, test = hd_sce, label="NK cells")
+```
+
+```{r}
+# Run SingleR to identify cell types PER CLUSTER
+pred.ct.4 <- SingleR(
+  test = hd_sce,
+  ref = ref_monaco,
+  labels = ref_monaco$label.main,
+  clusters = hd_clusters
+)
+```
+
+```{r}
+# Evaluate the predicted cell types
+table(pred.ct.4$labels)
+plotScoreHeatmap(pred.ct.4)
+```
+
+### Seurat reference: bmcite
+
+```{r}
+# Import bmcite data to use as reference cell types 
+library(SeuratData)
+InstallData("bmcite")
+data("bmcite")
+```
+
+```{r}
+# Get RNA counts (already log-normalized)
+bmc_ref <- GetAssayData(bmcite, assay = "RNA", layer = "data")
+ref_labels <- bmcite$celltype.l2
+table(ref_labels)
+```
+
+```{r}
+# Anotate each cell type in the original dataset
+pred.ct.5 <- SingleR(
+  test = hd_sce,
+  ref = bmc_ref,
+  labels = ref_labels
+)
+```
+
+```{r}
+# Evaluate the predicted cell types
+table(pred.ct.5$labels)
+plotScoreHeatmap(pred.ct.5)
+plotMarkerHeatmap(results = pred.ct.5, test = hd_sce, label="CD56 bright NK")
+```
+
+```{r}
+# Anotate each Seurat cluster
+pred.ct.6 <- SingleR(
+  test = hd_sce,
+  ref = bmc_ref,
+  labels = ref_labels,
+  clusters = hd_clusters
+)
+```
+
+```{r}
+# Evaluate the predicted cell types
+table(pred.ct.6$labels)
+plotScoreHeatmap(pred.ct.6)
+```
+
+With no doubt, the richest collection of cells is bmcite. Although the picked 
+celldex references are able to identify cell types in our query dataset, their
+predictive cappacity is clearly conditioned for being both of them from PBMCs
+samples. We will select bmcite to annotate the cells in our dataset and, afterwards,
+we will evaluate the quality of the correspondences.
+
+### Anotate HD with SingleR
+
+```{r}
+# Dataframe joining seurat.cluster + SingleR celltype prediction
+df_labels <- data.frame(
+  cell = names(hd_clusters),
+  cluster = as.character(hd_clusters),
+  celltype = pred.ct.5$labels
+)
+```
+
+```{r}
+# Assign the most common cell type in the cluster as its identity
+cluster_labels <- df_labels %>%
+  group_by(cluster) %>%
+  summarize(assigned_type = names(sort(table(celltype), decreasing = TRUE))[1])
+
+cluster_labels
+
+# Assign cluster identity to each cell according to SingleR
+integrated_hd_sct$SingleR_label <- cluster_labels$assigned_type[match(Idents(integrated_hd_sct), cluster_labels$cluster)]
+```
+
+```{r}
+# Visualize the named clusters
+DefaultAssay(integrated_hd_sct) <- 'integrated'
+p1 <- DimPlot(integrated_hd_sct, reduction = 'umap', group.by = "SingleR_label", label = TRUE)
+p1
+```
+
+As it can be appreciated, the annotation is almost perfect visually. 
+Each Seurat cluster from the integrated datasets of healthy donors is 
+defined by a single cell type/subtype. We will add these tags to the
+cells in our Seurat object. 
+
+```{r}
+# Add individual cell prediction to Seurat object to increase resolution
+integrated_hd_sct$SingleR_label_cell <- pred.ct.5$labels
+```
+
+```{r}
+# Save current object
+integ_annot_hd_sct <- integrated_hd_sct
+save(integ_annot_hd_sct, file = './annotated_HD_CITE.rda')
+```
+
+### Confirm cell types and subtypes with ADT
+
+After automatic annotation, we can individually study the cell types predicted
+for each cluster. For so, we will employ differentially expressed CD identified 
+in the previous step (ADT markers). This is a strong advantage of the CITE-seq 
+approach.
+
+Nevertheless, we should bear in mind the identification of DE features between
+clusters should be interpreted with caution since it is inherently biased
+to make associations even in randomized datasets. The main reason is that
+the statistical contrast is performed between pre-formed clusters, that is to
+say, already stratified cells, so it is asummed that biological truth underscores the
+clusters observed. Importantly, detected marker genes will be biased towards what is missing. 
+In any case, although P-values may be inflated, their relative importance, in other
+words, their rank, will be maintained.
+
+Once cluster refinement is achieved, we will continue to integrate patient 
+samples to see differences in bone marrow niche cells.
+
+```{r}
+rm(list = ls())
+
+# Load annotated Seurat object
+load('./annotated_HD_CITE.rda')
+
+# Load ADT differentially expressed markers
+load('./adt_markers_HD.rda')
+
+# Load RNA differentially expressed markers
+load('./rna_markers_HD.rda')
+```
+
+```{r}
+# Visualize ADT markers with log2FC > 0.25
+# sig_adt <- adt_markers$avg_log2FC > 0.25
+# adt_markers[sig_adt,]
+adt_markers
+
+# Visualize filtered RNA markers
+sig_markers <- rna_markers$p_val_adj < 0.001 & rna_markers$avg_log2FC > 2
+rna_markers[sig_markers,]
+```
+
+Let's visualize the clusters according to Seurat and the annotated ones
+with novershtern dataset.
+
+```{r}
+# See the proportions of SingleR clusters (a) / cells (b) in Seurat clusters
+print('Seurat clusters vs. SingleR Clusters')
+a <- as.matrix(table(integ_annot_hd_sct$integrated_snn_res.0.6, integ_annot_hd_sct$SingleR_label))
+
+print('Seurat clusters vs. SingleR Cells')
+b <- as.matrix(table(integ_annot_hd_sct$integrated_snn_res.0.6, integ_annot_hd_sct$SingleR_label_cell))
+
+# Map cols to major cell types
+#1 Seurat clusters major celltypes
+all_celltypes <- union(colnames(a), colnames(b))
+col_palette <- palette.colors(length(all_celltypes), palette = "Polychrome 36")
+names(col_palette) <- all_celltypes
+
+# Use barplots to see the composition of each cluster
+barplot(t(a), col = col_palette[colnames(a)])
+legend("topright", legend = names(col_palette[colnames(a)]), bty = 'n', fill = col_palette[colnames(a)], ncol = 2, cex = 0.7, title = 'Identified cell types')
+
+barplot(t(b), col = col_palette[colnames(b)])
+legend("topright", legend = names(col_palette[colnames(b)]), bty = 'n', fill = col_palette[colnames(b)], ncol = 3, cex = 0.7, title = 'Identified cell subtypes')
+```
+
+From this barplots it can be apprecitated that the clusters are quite
+homogeneous in all cases: the correspondence between SingleR cells and UMAP
+clusters is very high. In other words, each cluster is mainly defined by a single
+cell type. The cases of ambiguity are between subtypes of the same major cell type,
+such as for T or B lymphocyte lineage. 
+
+```{r}
+# Plots of each cluster according to Seurat, SingleR (per cell & cluster)
+DimPlot(integ_annot_hd_sct, reduction = 'umap', label = TRUE, label.size = 2.5)
+DimPlot(integ_annot_hd_sct, reduction = 'umap', group.by = "SingleR_label", label = TRUE, label.size = 2.5)
+DimPlot(integ_annot_hd_sct, reduction = 'umap', group.by = "SingleR_label_cell", label = TRUE, label.size = 2.5)
+```
+
+If we increase the resolution and analyse the clusters at the cell level, 
+it can be seen that cell subtypes emerge in the limits of many defined clusters. 
+For example, CD56 bright NK cells, Progenitor B-1 cells or CD4 Naïve T-cells 
+appear where Seurat clusters have only identified a single biological identity.
+In any case, the annotation at the cluster level is sufficient and permissive
+enough in order to identify cells based on their transcriptomic profile.
+
+#### T-cell and NK subtypes
+
+Seurat clusters from the lower left corner in the UMAP plot are identified 
+as NK-cells (cluster 4) and several T-cell subtypes (clusters 2, 3, 6, 8, 12, 15). 
+These annotations are consistent with the expression of cell surface antigens 
+visualized in previous steps. 
+
+```{r}
+# Confirm expression of CD56 (NK marker) and CD3D (T cell)
+DefaultAssay(integ_annot_hd_sct) <- 'ADT'
+cd56.adt <- FeaturePlot(integ_annot_hd_sct, features = 'CD56-TCCTTTCCTGATAGG', reduction = 'umap', cols = c('lightgray', 'darkgreen')) + ggtitle('CD56 ADT')
+cd3.adt <- FeaturePlot(integ_annot_hd_sct, features = 'CD3-CTCATTGTAACTCCT', reduction = 'umap', cols = c('lightgray', 'darkgreen')) + ggtitle('CD3 ADT')
+
+vln.cd56 <- VlnPlot(integ_annot_hd_sct, features = 'CD56-TCCTTTCCTGATAGG') + ggtitle('CD56 ADT')
+vln.cd3 <- VlnPlot(integ_annot_hd_sct, features = 'CD3-CTCATTGTAACTCCT') + ggtitle('CD3 ADT')
+
+DefaultAssay(integ_annot_hd_sct) <- 'RNA'
+cd56.rna <- FeaturePlot(integ_annot_hd_sct, features = 'NCAM1', reduction = 'umap') + ggtitle('CD56 RNA')
+cd3.rna <- FeaturePlot(integ_annot_hd_sct, features = 'CD3D', reduction = 'umap') + ggtitle('CD3D RNA')
+
+cd56.rna | cd56.adt
+vln.cd56
+cd3.rna | cd3.adt
+vln.cd3
+```
+
+#### B-cell subtypes
+
+The set of cell types identified by Seurat in clusters 0+7+11+19 is assigned
+to the same lineage by SingleR annotation: B cells. One should recall B lymphocytes 
+found in human samples may be found in several differentiation stages in a relatively 
+high abundance. Naïve B-cells, Memory B-cells and Ab-producing B-plasmatic cells 
+(Plasmablasts) constitute the some examples.
+
+```{r}
+# Explore individual cells
+b_p <- DimPlot(integ_annot_hd_sct, reduction = 'umap', group.by = 'SingleR_label_cell',
+        cells = WhichCells(integ_annot_hd_sct, expression = SingleR_label_cell %in% c('Naive B'))) + ggtitle('Naïve B cells (SingleR)')
+
+baso_p <- DimPlot(integ_annot_hd_sct, reduction = 'umap', group.by = 'SingleR_label_cell', cols = 'turquoise',
+        cells = WhichCells(integ_annot_hd_sct, expression = SingleR_label_cell %in% c('Memory B'))) + ggtitle('Memory B cells (SingleR)')
+
+b_p | baso_p
+
+DimPlot(integ_annot_hd_sct, reduction = 'umap', group.by = 'SingleR_label_cell',
+        cells = WhichCells(integ_annot_hd_sct, expression = SingleR_label_cell %in% c('Naive B', 'Memory B')))
+```
+
+```{r}
+# See al ADTs
+all.adt <- rownames(integ_annot_hd_sct[['ADT']])
+all.adt
+```
+
+```{r}
+# Only selected cluster
+cl.bcells <- WhichCells(integ_annot_hd_sct, expression = integrated_snn_res.0.6 %in% c('0','7','11','19'))
+
+# Visualize the expression of several B-cell types markers
+DefaultAssay(integ_annot_hd_sct) <- 'ADT'
+FeaturePlot(integ_annot_hd_sct, reduction = 'umap', cols = c('lightgray','darkgreen'),
+            # cells = cl.bcells,
+            features = c('CD32-GCTTCCGAATTACCG', 'CD45RA-TCAATCCTTCCGCTT', 'CD22-GGGTTGTTGTCTTTG'))
+
+DefaultAssay(integ_annot_hd_sct) <- 'RNA'
+FeaturePlot(integ_annot_hd_sct, features = c('TNFRSF13B','IGHD','TCL1A','JCHAIN','MZB1'), reduction = 'umap',
+            # cells = cl.bcells
+            )
+```
+With the DE features and ADTs identified in the assay, B cell types identified
+by the automatic annotation have been confirmed (B naïve: TCL1A+, IGHD+ / 
+B memory: TNFRSF13B+, TCL1A- & Plasmoblasts: JCHAIN+, MZB1+).
+
+```{r}
+# Get adjusted cell type frequencies in the whole dataset
+a1 <- table(integ_annot_hd_sct$SingleR_label)
+b1 <- table(integ_annot_hd_sct$SingleR_label_cell)
+
+# Get the fraction of cells over the size of the dataset
+tot_cells <- ncol(integ_annot_hd_sct)
+sum(a1) == sum(b1) & sum (b1) == tot_cells # Check total cell number matches IN EVERY CASE
+
+a_rel <- a1 / tot_cells
+b_rel <- b1 / tot_cells
+
+# Check al sums equal 1
+sum(a_rel)
+sum(b_rel)
+
+# Plot cell type relative frequency
+ymax.a <- max(a_rel)
+ymax.b <- max(b_rel)
+
+bp_a <- barplot(a_rel, col = col_palette[names(a_rel)], las = 2, ylim = c(0, round(ymax.a+0.05, digits = 2)))
+text(x = bp_a, y = a_rel + 0.02, labels = round(a_rel, 4), cex = 0.7, srt = 90)
+
+bp_b <- barplot(b_rel, col = col_palette[names(b_rel)], las = 2, ylim = c(0, round(ymax.b+0.05, digits = 2)))
+text(x = bp_b, y = b_rel + 0.02, labels = round(b_rel, 4), cex = 0.7, srt = 90)
+```
+
+Finally, if we observe how many of the identified cell types and subtypes came
+from each original dataset (HD1, HD2, HD3), in general terms, cell types are widely
+represented in all three healthy donor samples. In contrast, some subpopolutions 
+mainly correspond to individual datasets. This fact supports the integration of
+all 3 datasets in order to get the broadest set of cell types as a reference, while
+it is also indicative of the homogeneity in the annotation. 
+
+```{r}
+# Analyze how many cells belonged to the each HD dataset
+hd_cells <- as.matrix(table(integ_annot_hd_sct$SingleR_label, integ_annot_hd_sct$patient.id))
+per.cell.sums <- rowSums(hd_cells)
+
+hd_subtypes <- as.matrix(table(integ_annot_hd_sct$SingleR_label_cell, integ_annot_hd_sct$patient.id))
+per.subtype.sums <- rowSums(hd_subtypes)
+
+donor_per <- apply(hd_cells, 2, function(x){x / per.cell.sums})
+donor_per_cell <- apply(hd_subtypes, 2, function(x){x / per.subtype.sums})
+
+# Check the split has been applied correctly
+rowSums(donor_per)
+rowSums(donor_per_cell)
+
+# Apply a color palette
+hd_palette <- c('#007190','#f3a257','#34454c')
+names(hd_palette) <- colnames(hd_cells)
+
+barplot(t(donor_per), las = 2, col = hd_palette, ylim = c(0, 1.2))
+legend('top', colnames(hd_cells), ncol = 3, fill = hd_palette[colnames(hd_cells)], xpd = TRUE, bty = 'n')
+
+barplot(t(donor_per_cell), las = 2, col = hd_palette, ylim = c(0, 1.2))
+legend('top', colnames(hd_subtypes), ncol = 3, fill = hd_palette[colnames(hd_subtypes)], xpd = TRUE, bty = 'n')
+```
+
+In summary, the integrative analysis of the three healthy donor CITE-seq datasets successfully stratified cells according to their transcriptomic profiles. From the linear dimensionality reduction (PCA) performed on the normalized RNA data, 20 principal components were selected based on the elbow rule. These PCs capture the majority of genetic variability in the dataset and enabled the classification of each observation into biologically informative clusters. Automatic annotation proved to be a powerful tool for identifying cells based on a well-characterized reference dataset, in this case, bmcite. Furthermore, the visualization of differentially expressed genes and protein markers helped to confirm cellular identity in cases where ambiguity existed.
+
+Having established a reference dataset corresponding to healthy donors, we will now integrate patient samples to analyze differences in BMMC composition that may be associated with the phenotypic variables under study.
+
+## EXTRA: Multimodal analysis with WNN for CITE-seq weighted analysis
+
+Rather than considerating the contribution of the transcriptomic profiles from
+RNA capture, an alternative analysis involves the integration of ADT and RNA counts
+into a single model that reflects the individual importance of each measurement
+for each cell. Given the multimodal nature of the data, a WNN analysis integrating 
+RNA and ADT information was performed to confirm the robustness of the identified 
+cell populations. 
+
+```{r}
+wnn.seu.obj <- integ_annot_hd_sct
+
+# RNA data is already normalized and its dimensionality reduced
+# DefaultAssay(wnn.seu.obj) <- 'RNA' %>% SCTransform() %>% RunPCA ...
+
+# ADT data is normalized with CLR but its dimensionality is not linear-reduced nor scaled
+DefaultAssay(wnn.seu.obj) <- 'ADT'
+
+# Assign all detected CDs as VariableFeatures
+VariableFeatures(wnn.seu.obj) <- rownames(wnn.seu.obj[["ADT"]])
+
+# Pipeline to normalize, scale and reduce dim of SCT counts
+wnn.seu.obj <- NormalizeData(wnn.seu.obj, normalization.method = 'CLR', margin = 2) %>% 
+  ScaleData() %>% RunPCA(reduction.name = 'apca')
+```
+
+```{r}
+# Identify multimodal neighbors, these will be stored in the neighbors slot
+wnn.seu.obj <- FindMultiModalNeighbors(
+  wnn.seu.obj, reduction.list = list("pca", "apca"), 
+  dims.list = list(1:30, 1:18), modality.weight.name = "RNA.weight"
+)
+```
+
+We can now use these results for downstream analysis, such as visualization and clustering. For example, we can create a UMAP visualization of the data based on a weighted combination of RNA and protein data We can also perform graph-based clustering and visualize these results on the UMAP, alongside a set of cell annotations.
+
+```{r}
+# Run non-linear reduction to see combined (RNA+ADT) cellular differences 
+wnn.seu.obj <- RunUMAP(wnn.seu.obj, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+
+# Find cell clusters according to combined data
+wnn.seu.obj <- FindClusters(wnn.seu.obj, graph.name = "wsnn", algorithm = 3, resolution = 2, verbose = FALSE)
+```
+
+```{r}
+# Visualize the resulting UMAP plot
+p1 <- DimPlot(wnn.seu.obj, reduction = 'wnn.umap', label = TRUE, repel = TRUE, label.size = 2.5) + NoLegend()
+p1
+
+p2 <- DimPlot(wnn.seu.obj, reduction = 'wnn.umap', label = TRUE, repel = TRUE, label.size = 2.5, group.by = 'SingleR_label') + NoLegend()
+p2
+```
+
+Although the WNN framework revealed additional substructure within major cell populations, the RNA-based clustering was retained for downstream analyses, as it provided a more interpretable and biologically meaningful level of resolution for comparative purposes.
+

@@ -1,0 +1,136 @@
+---
+title: "scRNA-seq_patients_analysis"
+author: "Pablo López Nieto"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Install pacman pkg if not installed
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+# Loading required packages to the session
+pacman::p_load(Seurat, Biobase, ggplot2, patchwork, glmGamPoi,
+               celldex, SingleR, SingleCellExperiment, dplyr)
+```
+
+## Quality control of patient CITE-seq experiments
+
+Now, we will load the list of Seurat objects that contain the scRNA-seq dataset
+for each patient.
+
+```{r}
+load('./patients_CITE_seurat.rda')
+```
+
+```{r}
+cells_pre <- c()
+
+plots_all <- list()
+
+for (i in 1:length(seurat_list)) {
+  # Show metadata slot
+  metadata_i <- seurat_list[[i]]@meta.data$patient.id[1]
+  print(metadata_i)
+  
+  # Print dimensions of each dataset
+  dim_i <- dim(seurat_list[[i]])
+  print(dim_i)
+  cells_pre <- c(cells_pre, ncol(seurat_list[[i]]))
+  
+  # Calculate QC metrics for each dataset
+  DefaultAssay(seurat_list[[i]]) <- 'RNA'
+  seurat_list[[i]][['mito.per']] <- PercentageFeatureSet(seurat_list[[i]], pattern = '^MT-')
+  
+  # Plot nCount_RNA, nFeature_RNA & mito.per
+  p <- VlnPlot(seurat_list[[i]], features = c('nCount_RNA','nFeature_RNA','mito.per'), 
+          group.by = 'patient.id', layer = 'counts')
+  print(p)
+  
+  # Plot correlation between nCount and nFeature
+  fs <- FeatureScatter(seurat_list[[i]], feature1 = 'nFeature_RNA', feature2 = 'nCount_RNA', group.by = 'patient.id')
+  print(fs)
+  
+  # Update lists
+  plots_all[[length(plots_all) + 1]] <- p
+  plots_all[[length(plots_all) + 1]] <- fs
+}
+
+final_plot <- wrap_plots(plots_all, ncol = 4)
+ggsave(
+  "QC_all_samples_single_page.pdf",
+  final_plot,
+  width = 25,
+  height = 30
+)
+```
+
+Patient samples displayed a higher mitochondrial transcript fraction compared to healthy donors, 
+consistent with increased cellular stress and reduced RNA integrity.
+
+```{r}
+# Create a list to filter each parameter
+filtering_list <- list(
+  # nCount_min, nCount_max, mito.per_max
+  c(500, 3000, 30), 
+  c(500, 3500, 30), 
+  c(700, 3000, 25), 
+  c(500, 3000, 30),
+  c(300, 3000, 30),
+  c(500, 3500, 30), 
+  c(500, 3000, 30), 
+  c(500, 3000, 25), 
+  c(750, 3500, 25), 
+  c(500, 3200, 20)
+)
+```
+
+```{r}
+cells_post <- c()
+
+# Iterate over the list of seurat objects`
+for (i in 1:length(seurat_list)) {
+  # Subset the original dataset
+  seurat_list[[i]] <- subset(
+    seurat_list[[i]],
+    subset = nFeature_RNA > filtering_list[[i]][1] & 
+      nFeature_RNA < filtering_list[[i]][2] & 
+      mito.per < filtering_list[[i]][3])
+  
+  # Print the dims of the filtered object
+  print(seurat_list[[i]]@meta.data$patient.id[1])
+  dim_i <- dim(seurat_list[[i]])
+  print(dim_i)
+  
+  # Extract the number of cells
+  cells_post <- c(cells_post, ncol(seurat_list[[i]]))
+}
+```
+
+```{r}
+# Amount of cells filtered by QC
+print('Number of cells in the raw dataset')
+cells_pre
+print('Number of cells post-QC')
+cells_post
+print('Number of cells filtered')
+cells_filt <- cells_pre - cells_post
+cells_filt
+
+# Percentage of cells filtered
+print('Percentage of cells filtered out from the analysis')
+paste0(round(100* cells_filt / cells_pre, 2),'%')
+
+```
+```{r}
+# Save the filtered seurat objects
+save(seurat_list, file = './patients_CITE_seu_filt.rda')
+```
+
+
