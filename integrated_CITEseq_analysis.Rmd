@@ -1013,9 +1013,9 @@ rm(list = ls())
 load('./DE_CD4mem_respnonresp.rda')
 
 # Get gene list
-res[res$padj < 0.05,]
 gene.list <- res$stat
 names(gene.list) <- rownames(res)
+gene.list <- gene.list[is.finite(gene.list)]
 gene.list <- sort(gene.list, decreasing = TRUE)
 
 # Download gene sets from EnrichmentBrowser
